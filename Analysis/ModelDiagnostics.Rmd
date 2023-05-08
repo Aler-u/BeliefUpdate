@@ -1,0 +1,197 @@
+---
+title: "Diagnosticos"
+author: "Alejandro Ramos Usaj"
+date: "2023-03-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(brms)
+library(tidyverse)
+library(bayesplot)
+library(tidybayes)
+library(broom.mixed)
+```
+
+# BART Steps
+
+1.  Explicar el modelo 
+
+2.  Reportar detalles de computo (pendiente)
+
+3.  Describir la distribucion posterior
+
+    1.  [Posterior predictive check]
+    2.  [Posterior summary]
+
+4.  Reportar decisiones y criterios (pendiente)
+
+5. [Sensitivity Analysis]
+
+# Model building
+
+```{r}
+#Load data
+load('../data/exp1_data.RData')
+
+#Compute factor column for good/bad news 
+dexp1 <- dexp1 %>%
+  mutate(
+    news = factor(ifelse(I==0, "bad", "good")),
+    subj = as.integer(subj)
+  )
+
+update_model <- brm(update ~ 
+                news * scoreOptimismo * ep +
+                news * scoreAnsiedad * ep +
+                news * pT +
+                (1 | subj),
+              data = dexp1,
+              seed = 1234, # for reproducibility
+              cores = 4, chains = 4,
+              iter = 10000, 
+              file = "model_fits/FitExp1"
+)
+
+
+update_model_parameters <- variables(update_model)
+update_model_params_other <- update_model_parameters[
+  !stringr::str_detect(update_model_parameters, 'b_|subj')
+]
+
+prior_summary(update_model)
+```
+
+# Modelo de update lineal
+
+## Trace
+
+### Fixed
+
+```{r}
+mcmc_trace(update_model, pars = vars(contains('b_')))
+```
+
+### Random
+
+```{r}
+mcmc_trace(update_model, pars = vars(contains('subj')))
+```
+
+### Other
+
+```{r}
+mcmc_trace(update_model, pars = update_model_params_other)
+```
+
+## Dens
+
+### Fixed
+
+```{r}
+mcmc_dens(update_model, pars = vars(contains('b_')))
+```
+
+### Random
+
+```{r}
+mcmc_dens(update_model, pars = vars(contains('subj')))
+```
+
+### Other
+
+```{r}
+mcmc_dens(update_model, pars = update_model_params_other)
+```
+
+## Dens overlay
+
+### Fixed
+
+```{r}
+mcmc_dens_overlay(update_model, pars = vars(contains('b_')))
+```
+
+### Random
+
+```{r}
+mcmc_dens_overlay(update_model, pars = vars(contains('subj')))
+```
+
+### Other
+
+```{r}
+mcmc_dens_overlay(update_model, pars = update_model_params_other)
+```
+
+## Autocorrelation
+
+```{r}
+mcmc_acf_bar(update_model, pars = vars(contains('b_')))
+```
+
+## ESS
+
+```{r}
+neff_ratio(update_model)
+```
+
+## R-hat
+
+```{r}
+rhat(update_model)
+```
+
+## Posterior predictive check
+
+```{r}
+brms::pp_check(update_model, ndraws = 50)
+```
+
+## Posterior summary
+
+```{r}
+tidy(update_model, conf.level = 0.95, conf.method = 'HPDinterval')
+```
+
+
+## Sensitivity Analysis
+
+Para el analisis de sensibilidad vamos a comparar el modelo original donde se usaban los priors defaults de brms con un modelo identico donde los priors para los elementos `b` se fijaron en una normal estandard (0,1) dado que la variable de respuesta no puede exceder el -1 o el 1 por lo que ningun efecto podria en principio ser mayor o menor que esos dos valores. Sin embargo no se impusieron condiciones restrictivas como una distribucion uniforme entre -1 y 1 de manera que no este definida la distribucion por fuera de ese rango. Estos priors entonces son mucho mas informativos que los _flat_ priors usados por default por brms. 
+
+Para esto primero fijamos los nuevos priors del modelo.
+
+```{r}
+priors <- c(
+  set_prior("normal(0,1)", class = "b")
+)
+```
+
+Ajustamos el nuevo modelo con los nuevos priors
+
+```{r}
+sensitivity_update_model <- update_model <- brm(update ~ 
+                news * scoreOptimismo * ep +
+                news * scoreAnsiedad * ep +
+                news * pT +
+                (1 | subj),
+              data = dexp1,
+              prior = priors,
+              seed = 5678, # for reproducibility
+              cores = 4, chains = 4,
+              iter = 10000, 
+              file = "model_fits/FitExp1_sensitivity"
+)
+stancode(update_model)
+```
+
+Ahora lo que queremos es ver como cambia la estimacion de la posterior para cada parametro. 
+
+```{r}
+difference_matrix <- tidy_draws(update_model) %>% select(!starts_with('.')) %>% data.matrix() - tidy_draws(sensitivity_update_model) %>% select(!starts_with('.')) %>% data.matrix()
+```
+

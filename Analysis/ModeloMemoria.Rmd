@@ -1,0 +1,451 @@
+---
+title: "ModelSelection"
+author: "Alejandro Ramos Usaj"
+date: "2023-03-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(marginaleffects_posterior_interval = "hdi")
+options(marginaleffects_posterior_center = mean)
+```
+
+
+```{r}
+library(brms)
+library(tidybayes)
+library(tidyverse)
+library(bayesrules)
+library(bayesplot)
+library(marginaleffects)
+```
+
+
+```{r}
+#Load data
+load('../data/exp1_data.RData')
+
+#Compute influence score based on Zanete and factor column for good/bad news 
+dexp1 <- dexp1 %>%
+  mutate(
+    influencia = (p2-p1)/(pT-p1),
+    news = factor(ifelse(I==0, "bad", "good")),
+    subj = as.integer(subj)
+  )
+```
+
+Se excluyen del modelo los datos con valores mayores a 1 que son en realidad `NA`
+
+```{r}
+memory_data <- dexp1 %>% filter(memory1 <= 1)
+```
+
+
+Visualizamos la variable dependiente.
+
+```{r}
+ggplot(
+  memory_data,
+  aes(x = memory1)
+) +
+  geom_histogram()
+```
+
+La variable de respuesta esta acotada entre el 0 y el 1.
+
+```{r}
+range(memory_data$memory1)
+```
+
+En principio vamos a comenzar utilizando un modelo lineal ignorando la naturaleza acotada en el rango de la variable y en caso de observar un pobre ajuste vamos a considerar otros modelos mas apropiados. 
+
+En todos los casos la formula del modelo va a ser la misma con lo cual la defino ahora para todos los casos.
+
+```{r}
+formula_memory <- as.formula(
+  'memory1 ~ news * scoreOptimismo * ep +
+                news * scoreAnsiedad * ep +
+                news * pT +
+                (1 | subj)'
+)
+```
+
+
+# Modelo Lineal
+
+## Prior predictive. 
+
+Dado que el rango de valores esta acotado establecemos priors debiles para todos los coeficientes. 
+
+```{r}
+normal_weakprios <- set_prior('normal(0,5)', class = 'b')
+```
+
+Ahora tratamos de evaluar el desempeño del modelo unicamente con los priors.
+
+```{r}
+prior_linearl_model <- brm(formula_memory,
+            data = memory_data,
+            seed = 1234, # for reproducibility
+            cores = 4, chains = 4,
+            iter = 10000, 
+            sample_prior = 'only',
+            prior = normal_weakprios,
+            file = "model_fits/PriorPredictiveLinearMemory"
+            )
+```
+
+Comparamos las predicciones de los modelos con los datos.
+
+```{r}
+bayesplot::ppc_hist(
+  memory_data$memory1,
+  brms::posterior_predict(prior_linearl_model, ndraws = 11)
+)
+```
+
+Las predicciones tienen un rango mucho mas amplio que los datos. Esta es una de las consecuencias naturales del modelo lineal dado que el rango de las respuesta no esta acotado. Sin embargo podemos avanzar e intentar ajustar el modelo lineal a los datos. 
+
+Armo primero un modelo lineal.
+
+```{r}
+modelo_lineal <- brm(formula_memory,
+            data = memory_data,
+            seed = 1234, # for reproducibility
+            cores = 4, chains = 4,
+            iter = 10000,
+            prior = normal_weakprios,
+            file = "model_fits/Exp1_memory_lineal"
+            )
+```
+
+Evaluamos algunos diagnosticos del proceso MCMC.
+
+```{r}
+# Trace plots of parallel chains
+mcmc_trace(modelo_lineal, size = 0.1)
+
+# Density plots of parallel chains
+mcmc_dens_overlay(modelo_lineal)
+
+# R hat values
+rhat(modelo_lineal)
+
+# ESS Values
+neff_ratio(modelo_lineal)
+```
+Aunque los diagnosticos parecen ser correctos. Es necesario ver que tan bien se desempeñan las predicciones del modelo a comparacion de los datos. Para eso hacemos un posterior predictive check
+
+```{r}
+pp_check(modelo_lineal)
+```
+
+El ajuste del modelo es bastante malo, principalmente pareceria no seguir la forma asimetrica de la distribucion dado las limitaciones de la normal previamente descriptas. 
+
+
+## Modelo beta zero-inflated
+
+Aunque un modelo beta seria una primera alternativa, tenemos un muchos valores de 0 en los datos.
+
+```{r}
+sum(!memory_data$memory1 > 0)
+```
+
+Aunque estos no representan (en terminos relativos) un numero muy alto.
+
+```{r}
+sum(!memory_data$memory1 > 0)/nrow(memory_data)
+```
+
+Dado que un modelo beta tradicional no es capaz de lidiar con estos valores quedan dos opciones posibles. Una es excluir estos valores de los datos, ignorando su ocurrencia. Aunque su frecuencia relativa es baja no queda del todo claro si esto seria el abordaje adecuado o si estariamos perdiendo informacion valiosa. Otra opcion seria sumar una constante pequeña para que estos valores dejen de ser 0.
+
+## Prior predictive
+
+Examinamos los priors presentes en el modelo
+
+```{r}
+get_prior(
+  bf(memory1 ~ news * scoreOptimismo * ep +
+                news * scoreAnsiedad * ep +
+                news * pT +
+                (1 | subj),
+     zi ~ 1
+     ),
+  data = memory_data,
+  family = zero_inflated_beta()
+)
+```
+
+Para los coeficientes definimos un prior normal(0,2) de manera que acotemos el rango de posibles valores a algo mas plausible pero igualmente poco informativo. Para el valor del componente encargado de la generacion de 0 definimos un prior normal(-3,1) para ubicar el rango de valores en numeros pequeños, cercanos a 0. Por ultimo para la ordenada definimos el mismo prior que para los coeficientes por los mismos motivos. 
+
+```{r}
+beta_weakpriors <- c(
+  set_prior('normal(0,2)', class = 'b'),
+  set_prior('normal(-3,1)', class = 'Intercept', dpar = 'zi'),
+  set_prior('normal(0,2)', class = 'Intercept'),
+  set_prior('gamma(1,0.01)', class = 'phi'),
+  set_prior('normal(0,1)', class = 'sd')
+)
+```
+
+## Prior predictive
+
+Realizamos el prior predictive model para examinar los resultados.
+
+```{r}
+zero_beta_fit_prior <- brm(
+  bf(memory1 ~ news * scoreOptimismo * ep +
+                news * scoreAnsiedad * ep +
+                news * pT +
+                (1 | subj),
+     zi ~ 1
+     ),
+  data = memory_data,
+  family = zero_inflated_beta(),
+  seed = 1234, # for reproducibility
+  cores = 4, chains = 4,
+  iter = 10000,
+  sample_prior = 'only',
+  prior = beta_weakpriors,
+  file = "model_fits/MemoryZeroBetaPrior"
+            )
+```
+
+
+```{r}
+pp_check(zero_beta_fit_prior)
+```
+
+Las predicciones de la variable de respuesta parecen moverse entre los extremos de 0 y 1 aunque no existen virtualmente datos por encima de 0.5 esto es algo a considerar a futuro. 
+
+## Posterior model
+
+Ajustamos el modelo completo. 
+
+```{r}
+zero_beta_fit <- brm(
+  bf(memory1 ~ news * scoreOptimismo * ep +
+                news * scoreAnsiedad * ep +
+                news * pT +
+                (1 | subj),
+     zi ~ 1
+     ),
+  data = memory_data,
+  family = zero_inflated_beta(),
+  seed = 1234, # for reproducibility
+  cores = 4, chains = 4,
+  iter = 10000,
+  prior = beta_weakpriors,
+  file = "model_fits/Exp1_memory_zerobeta"
+            )
+```
+
+```{r}
+pp_check(zero_beta_fit)
+```
+
+
+
+Reflejamos un resumen de los coeficientes calculados. 
+
+```{r}
+prior_summary(zero_beta_fit)
+broom.mixed::tidy(zero_beta_fit, effects = 'fixed') %>% mutate(new = plogis(estimate))
+```
+
+Calculamos el average marginal mean de la memoria de los sujetos para cada tipo de respuesta.
+
+```{r}
+avg_predictions(
+  zero_beta_fit, by = 'news'
+)
+```
+
+
+```{r}
+posterior_news_draws <- avg_predictions(
+  zero_beta_fit, by = 'news'
+) |> posterior_draws()
+
+posterior_news_draws |> ggplot(
+    aes(x = draw, fill = news)
+  ) +
+  stat_slab(alpha = 0.75) +
+  stat_pointinterval(position = position_dodge(width = .3, preserve = "single"), point_interval = 'mean_hdi') +
+  scale_y_continuous('Posterior Density', breaks = NULL) +
+  scale_fill_discrete('News Valence', labels = c('Bad News','Good News')) +
+  theme_tidybayes() + xlab("Memory Response")
+
+posterior_news_draws |>
+  pivot_wider(id_cols = drawid, names_from = news, values_from = draw) |> 
+  transmute(
+    diferencia = good - bad
+  ) |> ggplot(
+    aes(x = diferencia)
+  ) +
+  stat_halfeye(point_interval = 'mean_hdi')
+```
+
+Tambien calculamos directamente el average marginal effect, que seria la diferencia en la memoria, para los dos tipos de noticias.
+
+```{r}
+posterior_news_draws |>
+  pivot_wider(id_cols = drawid, names_from = news, values_from = draw) |> 
+  transmute(
+    diferencia = good - bad
+  ) |>
+  pull(diferencia) |>
+  ggdist::mean_hdi()
+```
+
+
+```{r}
+avg_slopes(
+  zero_beta_fit,
+  variables = 'ep'
+)
+avg_slopes(zero_beta_fit, variables = c("ep"), by = c('news'))
+```
+
+
+Calculamos el average marginal effect del optimismo y la ansiedad
+
+```{r}
+avg_slopes(
+  zero_beta_fit, 
+  variables = 'scoreOptimismo'
+)
+avg_slopes(
+  zero_beta_fit, 
+  variables = 'scoreAnsiedad'
+)
+```
+
+Chequeamos ahora si hay una diferencia en el optimismo o la ansiedad mediado por el tipo de noticias.
+
+```{r}
+avg_slopes(zero_beta_fit, variables = c("scoreOptimismo"), by = c('news'))
+avg_slopes(zero_beta_fit, variables = c("scoreAnsiedad"), by = c('news'))
+```
+
+```{r}
+avg_slopes(zero_beta_fit, variables = 'pT')
+avg_slopes(zero_beta_fit, variables = c("pT"), by = c('news')) |> posterior_draws() |> 
+  pivot_wider(id_cols = drawid, names_from = news, values_from = draw) |> 
+  transmute(
+    diferencia = good - bad
+  ) |>
+  pull(diferencia) |>
+  ggdist::mean_hdi()
+```
+
+
+
+```{r}
+pp_check(zero_beta_fit)
+```
+
+
+```{r}
+broom.mixed::tidy(zero_beta_fit, conf.method = 'HPDinterval') %>% mutate(new_estimate = plogis(estimate), newlow = plogis(conf.low),
+                                                                         newhigh = plogis(conf.high))
+
+broom.mixed::tidy(zero_beta_fit, conf.method = 'HPDinterval', parameters = 'phi') %>% mutate(
+  new_estimate = exp(estimate),
+  newlow = exp(conf.low),
+  newhigh = exp(conf.high)
+)
+```
+
+
+
+# Alternativa
+
+
+El valor absoluto de la diferencia depende del valor de pT. Por ejemplo un valor de pT de 0.5 implica que la maxima diferencia (absoluta) que se puede obtener es de 0.5 mientras que un valor de pT mas cercano a 0 o a 1 implica un mayor rango de diferencias (absolutas) posible.
+
+```{r}
+ggplot(
+  memory_data %>% mutate(pregID = fct_reorder(factor(pregID), memory1)),
+  aes(y = pregID, x = memory1)
+) +
+  geom_boxplot() +
+  geom_point(aes(x = pT), color = 'red', shape = 2)
+
+memory_data %>% group_by(pregID) %>% summarise(pt = median(pT), mediana = median(memory1)) %>%
+  ggplot(
+    aes(x = pt, y = mediana)
+  ) +
+  geom_point() +
+  geom_smooth()
+```
+
+Quizas una alternativa podria ser ponderar la diferencia por la maxima diferencia posible para cada pregunta. Para calcularlo podemos calcular la distancia al 0 y al 1 de cada pregunta y tomar el valor maximo de los dos para dividir a la diferencia. De esta manera la diferencia representa la proporcion de la maxima diferencia posible. Entonces si la maxima diferencia es $m = max(|pT-1|,|pT-0|)$ el resultado de la diferencia estandarizada (diferencia prima) es $diferencia' = \frac{r-pT}{m}$ donde $r$ es la respuesta del sujeto. El resultado sigue quedando acotado entre 0 y 1 por lo que la eleccion de modelos posibles no se modifica demasiado. 
+
+```{r}
+memory_data <- memory_data %>%
+  rowwise() %>%
+  mutate(
+    memory_standard = memory1/max(abs(pT-1), abs(pT-0))
+  ) %>% ungroup()
+```
+
+
+Queremos convertir ahora el dataframe de manera que para cada sujeto tenga el doble de entradas de manera que la columna `memory1` y `memory2` sean una sola llamada `memory` y se genere otra columna nueva llamada `tiempo` que indique si fue una medicion de memoria a corto o largo plazo. 
+
+```{r}
+memory_data_long <- dexp1 |> filter(memory1 <= 1 & memory2 <= 1) |> pivot_longer(cols = c(memory1, memory2), names_to = 'tiempo', values_to = 'memory') |>
+  mutate(tiempo = ifelse(tiempo == 'memory1', 't1', 't2')) |>
+  filter(!is.na(memory))
+```
+
+
+```{r}
+modelo_long <- brm(
+  bf(memory ~ tiempo * news * ep +
+      news * scoreOptimismo * ep +
+      news * scoreAnsiedad * ep +
+      news * pT +
+      (1 | subj),
+     zi ~ 1
+     ),
+  data = memory_data_long,
+  family = zero_inflated_beta(),
+  seed = 1234, # for reproducibility
+  cores = 4, chains = 4,
+  iter = 10000,
+  prior = beta_weakpriors,
+  file = "model_fits/Exp1_memory_zerobeta_long"
+            )
+```
+
+```{r}
+# Trace plots of parallel chains
+mcmc_trace(modelo_long, size = 0.1, regex_pars = 'b_')
+
+# Density plots of parallel chains
+mcmc_dens_overlay(modelo_long, regex_pars = 'b_')
+
+# R hat values
+rhat(modelo_long)
+
+# ESS Values
+neff_ratio(modelo_long)
+```
+
+
+```{r}
+avg_predictions(modelo_long, variables = 'tiempo')
+avg_predictions(modelo_long, variables = 'tiempo') |> posterior_draws() |>
+  pivot_wider(id_cols = drawid, names_from = tiempo, values_from = draw) |> 
+  transmute(
+    diferencia = t1 - t2
+  ) |>
+  pull(diferencia) |>
+  ggdist::mean_hdi()
+  
+avg_slopes(modelo_long, variables = 'tiempo')
+avg_slopes(modelo_long, variables = 'tiempo', by = 'news') 
+```
+

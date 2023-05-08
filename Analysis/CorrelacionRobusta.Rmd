@@ -1,0 +1,168 @@
+---
+title: "Correlacion Ansiedad y Optimismo"
+author: "Alejandro Ramos Usaj"
+date: "2023-04-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(rstan)
+library(ggExtra)
+library(bayesplot)
+```
+
+
+En primer lugar graficamos la asociacion
+
+```{r}
+#Load data
+load('../data/exp1_data.RData')
+
+#Compute influence score based on Zanete and factor column for good/bad news 
+dexp1 <- dexp1 %>%
+  mutate(
+    news = factor(ifelse(I==0, "bad", "good")),
+    subj = as.integer(subj)
+  )
+
+p <- dexp1 |> group_by(subj) |> summarise(anx = unique(scoreAnsiedad), opt = unique(scoreOptimismo)) |>
+  ggplot(
+    aes(x = anx, y = opt)
+  ) +
+  geom_point() +
+  tidybayes::theme_tidybayes() + xlab("Anxiety") + ylab("Optimism")
+ggExtra::ggMarginal(p, type = 'histogram')
+```
+
+Dado la distribucion de ambas variables optamos por hacer un analisis de correlacion robusto. Para esto armamos un modelo en STAN
+
+```{r}
+modelo_stan <- model <- "
+data {
+    int<lower=1> N;  // number of observations
+    vector[2] x[N];  // input data: rows are observations, columns are the two variables
+}
+
+parameters {
+    vector[2] mu;                 // locations of the marginal t distributions
+    real<lower=0> sigma[2];       // scales of the marginal t distributions
+    real<lower=1> nu;             // degrees of freedom of the marginal t distributions
+    real<lower=-1, upper=1> rho;  // correlation coefficient
+}
+
+transformed parameters {
+    // Covariance matrix
+    cov_matrix[2] cov = [[      sigma[1] ^ 2       , sigma[1] * sigma[2] * rho],
+                         [sigma[1] * sigma[2] * rho,       sigma[2] ^ 2       ]];
+}
+
+model {
+  // Likelihood
+  // Bivariate Student's t-distribution instead of normal for robustness
+  x ~ multi_student_t(nu, mu, cov);
+    
+  // Noninformative priors on all parameters
+  sigma ~ normal(0,100);
+  mu ~ normal(0, 100);
+  nu ~ gamma(2, 0.1);
+}
+
+generated quantities {
+  // Random samples from the estimated bivariate t-distribution (for assessment of fit)
+  vector[2] x_rand;
+  x_rand = multi_student_t_rng(nu, mu, cov);
+}"
+```
+
+
+Antes de poder hacer la estimacion tenemos que preparar los datos en el formato correcto, es decir como una matriz con dos columnas. 
+
+```{r}
+corr_matrix <- dexp1 |> group_by(subj) |> 
+  summarise(anx = unique(scoreAnsiedad), opt = unique(scoreOptimismo)) |> 
+  select(-subj) |> 
+  as.matrix()
+```
+
+Ahora procedemos a correr el sampling por MCMC para estimar los parametros de interes.
+
+```{r}
+correlacion_robusta <- rstan::stan(
+  model_code = model, 
+  data = list(
+    x = corr_matrix, 
+    N = nrow(corr_matrix)
+              ),
+  iter=5000*2, chains=4, seed=13042023
+                    )
+```
+
+
+Ahora tenemos que analizar los diagnosticos de la cadena.
+
+```{r}
+stan_trace(correlacion_robusta, pars = names(correlacion_robusta))
+```
+
+
+```{r}
+stan_ac(correlacion_robusta, pars = names(correlacion_robusta))
+```
+
+```{r}
+lapply(
+  extract(correlacion_robusta),
+  function(x) data.frame(
+  rhat = Rhat(
+  matrix(x,nrow = 5000, ncol = 4)
+  ),
+  ess_b = ess_bulk(
+  matrix(x,nrow = 5000, ncol = 4)
+  ),
+  ess_t = ess_tail(
+  matrix(x,nrow = 5000, ncol = 4)
+  )
+  )
+)
+
+lapply(extract(correlacion_robusta), 
+       dim
+       )
+```
+
+
+
+
+```{r}
+data.frame(
+  rho = extract(correlacion_robusta)$rho
+) |> ggdist::mean_hdi()
+
+data.frame(
+  rho = extract(correlacion_robusta)$rho
+) |>
+  ggplot(
+    aes(x = rho)
+  ) +
+  ggdist::stat_halfeye(point_interval = 'mean_hdi', .width = c(0.8,0.95), fill = 'lightblue') +
+  ylab("Posterior Density") + xlab(expression(rho)) +
+  tidybayes::theme_tidybayes() 
+```
+
+
+
+
+
+
+
+```{r}
+rstan::stan_dens(test)
+rstan::stan_dens(test, pars = 'rho')
+rstan::extract(test)$rho |> ggdist::mean_hdi()
+```
+

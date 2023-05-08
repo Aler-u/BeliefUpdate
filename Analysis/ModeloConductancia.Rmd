@@ -1,0 +1,342 @@
+---
+title: "ModeloConductancia"
+author: "Alejandro Ramos Usaj"
+date: "2023-03-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(brms)
+library(tidyverse)
+library(bayesrules)
+library(tidybayes)
+library(bayesplot)
+library(marginaleffects)
+```
+
+```{r}
+#Load data
+load('../data/exp1_data.RData')
+
+#Compute influence score based on Zanete and factor column for good/bad news 
+dexp1 <- dexp1 %>%
+  mutate(
+    news = factor(ifelse(I==0, "bad", "good")),
+    subj = as.integer(subj)
+  )
+
+# Remove missing values
+skinresponse_data <- dexp1 %>% filter(scr1 > 0)
+```
+
+Analizamos la distribucion de valores perdidos por respuesta y tipo de noticia.
+
+```{r}
+dexp1 %>% group_by(pregID, news) %>% summarise(perdido = sum(!scr1 > 0)/n()) %>%
+  ggplot(
+    aes(x = perdido, y = pregID, fill = news)
+  ) +
+  geom_col(position = 'dodge')
+```
+
+Visualizamos la variable predictora (la respuesta de la piel)
+
+```{r}
+ggplot(
+  skinresponse_data,
+  aes(x = scr1)
+) +
+  geom_histogram()
+```
+
+## Modelo Lineal
+
+```{r}
+skinresponse_priors <- c(
+  set_prior('normal(0,2)', class = 'b')
+)
+```
+
+## Prior predictive
+
+```{r}
+conductancia_prior <- brm(update ~ news * scoreOptimismo * ep +
+                news * scoreAnsiedad * ep +
+                news * ep * scr1 +
+                news * pT +
+                (1 | subj),
+            data = skinresponse_data,
+            seed = 1234, # for reproducibility
+            cores = 4, chains = 4,
+            iter = 10000, 
+            sample_prior = 'only',
+            prior = skinresponse_priors,
+            file = "model_fits/ConductanciaLinealPrior"
+            )
+```
+
+```{r}
+pp_check(conductancia_prior)
+```
+
+
+```{r}
+conductancia_lineal <- brm(update ~ news * scoreOptimismo * ep +
+                news * scoreAnsiedad * ep +
+                news * ep * scr1 +
+                news * pT +
+                (1 | subj),
+            data = skinresponse_data,
+            seed = 1234, # for reproducibility
+            cores = 4, chains = 4,
+            iter = 10000, 
+            prior = skinresponse_priors,
+            file = "model_fits/Exp1_Conductancia_lineal"
+            )
+```
+
+
+```{r}
+pp_check(conductancia_lineal)
+```
+
+
+```{r}
+pp_check(test_model)
+```
+
+
+```{r}
+broom.mixed::tidy(conductancia_lineal)
+```
+
+
+# Efectos Marginales
+
+Ahora vamos a calcular los efectos que nos interesan. 
+
+## Conductancia
+
+```{r}
+avg_slopes(conductancia_lineal, variables = 'scr1')
+```
+
+
+```{r}
+broom.mixed::tidy(conductancia_lineal) |> filter(str_detect(term, 'scr1', negate = T))
+```
+
+```{r}
+update_model <- brm(update ~ 
+                news * scoreOptimismo * ep +
+                news * scoreAnsiedad * ep +
+                news * pT +
+                (1 | subj),
+              data = dexp1,
+              seed = 1234, # for reproducibility
+              cores = 4, chains = 4,
+              prior = priors,
+              iter = 10000, 
+              file = "model_fits/FitExp1"
+)
+
+broom.mixed::tidy(update_model)
+
+diferencia_entre_modelos <- lapply(
+  variables(update_model)[variables(update_model) |> str_detect('subj', negate = T)],
+  function(x) (
+    update_model |> spread_draws(!!sym(x)) |> pull(!!sym(x)) - conductancia_lineal |> spread_draws(!!sym(x)) |> pull(!!sym(x))
+               ) |>
+    mean_hdi() |> cbind(term = x)
+)
+
+diferencia_entre_modelos |> bind_rows() |> filter(!term %in% c('lp__', 'lprior')) |>
+  ggplot(
+    aes(x = y, xmin = ymin, xmax = ymax, y = term)
+  ) + geom_pointinterval() +
+  ylab("Parameter Name") + xlab("Posterior difference") + 
+  scale_y_discrete(labels = c('Prediction Error', 'Prediction Error x Anxiety', 'Intercept', 'News Valence',
+                              'News Valence x Prediction Error', 'News Valence x Prediction Error x Anxiety', 'News Valence x True Value',
+                              'News Valence x Anxiety', 'News Valence x Optimism', 'News Valence x Optimism x Prediction Error',
+                              'True Value', 'Anxiety', 'Optimism', 'Optimism x Prediction Error', 'Sigma')) +
+  theme_tidybayes()
+```
+
+
+```{r}
+avg_slopes(conductancia_lineal, variables = 'scr1', by = 'subj') |>
+  ggplot(
+    aes(x = subj, y = estimate, ymin = conf.low, ymax = conf.high)
+  ) +
+  geom_pointrange()
+```
+
+
+
+
+```{r}
+slopes(conductancia_lineal, newdata = 'mean', variables = 'scr1')
+```
+
+
+```{r}
+plot_predictions(conductancia_lineal, condition = 'scr1')
+```
+
+
+
+```{r}
+avg_slopes(conductancia_lineal, variables = c("scr1"), by = c('news'))
+```
+
+
+### Efecto de las noticias
+
+La pregunta para responder en este caso es ¿Cual es el efecto del tipo de noticia sobre el update? (marginalizando los valores de las otras covariadas)
+
+Un primer abordaje seria calcular los efectos marginales en la media (Marginal Effects at the Mean). Eso seria fijar las otras variables en la media y variar unicamente el tipo de noticia a la que se exponen los sujetos. 
+En principio calculamos esto ignorando los efectos especificos de grupo (los efectos random).
+
+```{r}
+avg_predictions(
+  conductancia_lineal,
+  newdata = datagrid(news = c('good', 'bad')),
+  by = 'news',
+  re_formula = NA
+)
+avg_comparisons(
+  conductancia_lineal,
+  newdata = datagrid(news = c('good', 'bad')),
+  variables = 'news',
+  re_formula = NA
+)
+avg_predictions(
+  conductancia_lineal,
+  newdata = datagrid(news = c('good', 'bad')),
+  by = 'news',
+  re_formula = NA) |> posterior_draws() |>
+  pivot_wider(id_cols = drawid, names_from = news, values_from = draw) |> 
+  mutate(diferencia = good - bad) |>
+  pull(diferencia) |> ggdist::median_hdi()
+```
+
+
+Ahora incorporamos los efectos especificos de grupo (random). Para esto fijamos el error de prediccion y el true value en la media pero usamos para cada sujeto su puntaje de ansiedad y optimismo en lugar de asignarles a todos el mismo puntaje.
+
+```{r}
+fixed_values_df <- data.frame(
+  ep = mean(dexp1$ep),
+  pT = mean(dexp1$pT),
+  scoreAnsiedad = dexp1 %>% group_by(subj) %>% summarise(scoreAnsiedad = mean(scoreAnsiedad)) %>% pull(scoreAnsiedad),
+  scoreOptimismo = dexp1 %>% group_by(subj) %>% summarise(scoreOptimismo = mean(scoreOptimismo)) %>% pull(scoreOptimismo),
+  subj = dexp1$subj |> unique()
+)
+```
+
+Tenemos ahora entonces en un dataframe los puntajes de ansiedad y optimismo para cada sujeto y un valor promedio de error de prediccion que es el mismo para todos los sujetos. Ahora con esto duplicamos el dataframe para agregar una columna con el tipo de noticias, variando la valencia.
+
+```{r}
+tipical_pred_df <- rbind(
+  cbind(fixed_values_df, news = 'bad'),
+  cbind(fixed_values_df, news = 'good')
+)
+```
+
+Con esto ya podemos generar las predicciones.
+
+```{r}
+avg_predictions(
+  conductancia_lineal,
+  newdata = tipical_pred_df,
+  by = 'news'
+)
+avg_comparisons(
+  conductancia_lineal,
+  newdata = tipical_pred_df,
+  variables = 'news'
+)
+avg_predictions(
+  conductancia_lineal,
+  newdata = tipical_pred_df,
+  by = 'news') |> posterior_draws() |>
+  pivot_wider(id_cols = drawid, names_from = news, values_from = draw) |> 
+  mutate(diferencia = good - bad) |>
+  pull(diferencia) |> ggdist::median_hdi()
+```
+
+Como segundo abordaje calculamos el efecto marginal usando los mismos datos es decir generando las predicciones para cada fila y luego promediando los resultados de las predicciones para cada tipo de noticia.
+
+```{r}
+avg_predictions(conductancia_lineal, by = 'news')
+avg_predictions(conductancia_lineal, by = 'news') |> posterior_draws() |>
+  pivot_wider(id_cols = drawid, names_from = news, values_from = draw) |> 
+  mutate(diferencia = good - bad) |>
+  pull(diferencia) |> ggdist::median_hdi()
+```
+
+Posteriormente nos preguntamos que pasa si cada trial fuera una noticia positiva o negativa. Este abordaje es muy similar al anterior donde fijamos los valores de error de prediccion, ansiedad, optimismo y true value. 
+
+```{r}
+avg_predictions(conductancia_lineal, variables = 'news')
+avg_predictions(conductancia_lineal, variables = 'news') |> posterior_draws() |>
+  pivot_wider(id_cols = drawid, names_from = news, values_from = draw) |> 
+  mutate(diferencia = good - bad) |>
+  pull(diferencia) |> ggdist::median_hdi()
+```
+
+El mismo resultado podemos obtenerlo con la funcion `avg_slopes`.
+
+```{r}
+avg_slopes(conductancia_lineal, newdata = datagrid(firm = -1:-100),
+    allow_new_levels = TRUE,
+    sample_new_levels = "gaussian", variables = c('news'))
+```
+
+Los valores son muy similares lo cual indica buena convergencia de los distintos metodos.
+
+No obstante, es posible calcular los efectos marginales sin integrar los efectos random del modelo. Para hacer esto el proceso es muy similar solo que obviamos la mencion a los nuevos sujetos, cada uno con efectos random sampleados a partir de la distribucion general de efectos random (asumida como gaussiana).
+
+Entonces por ejemplo para calcular el efecto marginal promedio de las noticias usamos de nuevo la funcion `predictions` pero excluimos el argumento `newdata` para agregar nuevos datos y los otros argumentos adicionales que controlan los efectos random.
+
+```{r}
+predictions(
+    conductancia_lineal,
+    by = 'news', 
+    re_formula = NA)
+```
+
+
+
+```{r}
+test <- slopes(conductancia_lineal, variables = 'scr1',
+               newdata = datagrid(
+                 ep = seq(range(skinresponse_data$ep)[1],range(skinresponse_data$ep)[2], length.out = 100)
+                 ),
+               re_formula = NULL
+                 )
+
+draws <- posterior_draws(test)
+
+draws %>% pull(draw) %>% ggdist::mean_hdi()
+```
+
+
+
+```{r}
+plot_slopes(conductancia_lineal, variables = 'scr1', condition = 'ep')
+plot_slopes(conductancia_lineal, variables = 'scr1', condition = 'ep', draw = F)
+```
+
+
+$$
+\begin{aligned}
+  \operatorname{update}_{i}  &\sim N \left(\mu, \sigma^2 \right) \\
+    \mu &=\alpha_{j[i]} + \beta_{1}(\operatorname{scr1}) + \beta_{2j[i]}(\operatorname{ep}) + \beta_{3}(\operatorname{ep} \times \operatorname{scr1}) \\
+    \alpha_{j}  &\sim N \left(\mu_{\alpha_{j}}, \sigma^2_{\alpha_{j}} \right)
+    \text{, for subj j = 1,} \dots \text{,J}
+\end{aligned}
+$$

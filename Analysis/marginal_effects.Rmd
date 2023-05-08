@@ -1,0 +1,707 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(brms)
+library(tidyverse)
+library(bayesrules)
+library(bayesplot)
+library(ggdist)
+```
+
+# Datos
+
+Cargamos los datos y modificamos algunas columnas
+
+```{r}
+#Load data
+load('../data/exp1_data.RData')
+
+#Compute influence score based on Zanete and factor column for good/bad news 
+dexp1 <- dexp1 %>%
+  mutate(
+    news = factor(ifelse(I==0, "bad", "good")),
+    subj = as.integer(subj)
+  )
+```
+
+# Modelo
+
+## Priors
+
+Evaluamos cuales son los priors presentes en el modelo. 
+
+```{r}
+get_prior(update ~ 
+            news * scoreOptimismo * ep +
+            news * scoreAnsiedad * ep +
+            news * pT +
+            (1 | subj),
+            data = dexp1,)
+```
+
+Vamos a evitar los flat priors que se usan por default en `brms`. Para los priors de todos los coeficientes vamos a usar una distribucion normal con $\mu=0$ y $\sigma = 2$. Esta eleccion esta justificada en que la variable de respuesta `update` esta limitada entre -1 y 1 por lo que los valores de los coeficientes no deberian alejarse de ese umbral. El resto de los priors los vamos a dejar en sus valores default. 
+
+Definimos entonces los priors del modelo.
+
+```{r}
+priors <- c(
+  set_prior("normal(0,5)", class = "b")
+)
+```
+
+Armamos un prior predictive check.
+
+```{r}
+prior_model_1 <- brm(update ~ 
+            news * scoreOptimismo * ep +
+            news * scoreAnsiedad * ep +
+            news * pT +
+            (1 | subj),
+            data = dexp1,
+            seed = 1234, # for reproducibility
+            cores = 4, chains = 4,
+            iter = 10000, 
+            sample_prior = 'only',
+            prior = priors,
+            file = "model_fits/Exp1PriorPredictive"
+            )
+```
+
+Chequeamos las predicciones del modelo.
+
+```{r}
+bayesplot::ppc_hist(
+  dexp1$update,
+  brms::posterior_predict(prior_model_1, ndraws = 11)
+)
+```
+
+El problema con este prior predictive check es que los valores de la variable de respuesta se salen del rango esperado. La variable de respuesta `update` no puede estar por encima de 1 ni por debajo de -1. 
+
+Procedemos adelante y generamos el modelo con los priors definidos anteriormente.
+
+# Model building
+
+Generamos el modelo. 
+
+```{r}
+update_model <- brm(update ~ 
+                news * scoreOptimismo * ep +
+                news * scoreAnsiedad * ep +
+                news * pT +
+                (1 | subj),
+              data = dexp1,
+              seed = 1234, # for reproducibility
+              cores = 4, chains = 4,
+              prior = priors,
+              iter = 10000, 
+              file = "model_fits/FitExp1"
+)
+
+update_model_parameters <- variables(update_model)
+update_model_params_other <- update_model_parameters[
+  !stringr::str_detect(update_model_parameters, 'b_|subj')
+]
+```
+
+# Diagnosticos
+
+Antes de proseguir chequeamos los diagnosticos del modelo
+
+## Trace
+
+### Fixed
+
+```{r}
+mcmc_trace(update_model, pars = vars(contains('b_')))
+```
+
+### Random
+
+```{r}
+mcmc_trace(update_model, pars = vars(contains('subj')))
+```
+
+### Other
+
+```{r}
+mcmc_trace(update_model, pars = update_model_params_other)
+```
+
+
+## Dens
+
+### Fixed
+
+```{r}
+mcmc_dens(update_model, pars = vars(contains('b_')))
+```
+
+### Random
+
+```{r}
+mcmc_dens(update_model, pars = vars(contains('subj')))
+```
+
+### Other
+
+```{r}
+mcmc_dens(update_model, pars = update_model_params_other)
+```
+
+## Dens overlay
+
+### Fixed
+
+```{r}
+mcmc_dens_overlay(update_model, pars = vars(contains('b_')))
+```
+
+### Random
+
+```{r}
+mcmc_dens_overlay(update_model, pars = vars(contains('subj')))
+```
+
+### Other
+
+```{r}
+mcmc_dens_overlay(update_model, pars = update_model_params_other)
+```
+
+## Autocorrelation
+
+```{r}
+mcmc_acf_bar(update_model, pars = vars(contains('b_')))
+```
+
+## ESS
+
+```{r}
+neff_ratio(update_model)
+```
+
+## R-hat
+
+```{r}
+rhat(update_model)
+```
+
+## Posterior predictive check
+
+```{r}
+brms::pp_check(update_model, ndraws = 50)
+```
+
+Ninguno de los diagnosticos hasta ahora parece arrojar nada preocupante pero el posterior predictive check muestra que el ajuste del modelo a los datos no es muy bueno. Es algo para discutir mas adelante.
+
+# Resultados
+
+Avanzamos con un resumen del modelo 
+
+## Posterior summary
+
+```{r}
+broom.mixed::tidy(update_model, conf.level = 0.95, conf.method = 'HPDinterval')
+```
+
+## Efectos Marginales
+
+Ahora vamos a calcular los efectos que nos interesan. 
+
+### Efecto de las noticias
+
+La pregunta para responder en este caso es ¿Cual es el efecto del tipo de noticia sobre el update? (marginalizando los valores de las otras covariadas)
+
+Un primer abordaje seria calcular los efectos marginales en la media (Marginal Effects at the Mean). Eso seria fijar las otras variables en la media y variar unicamente el tipo de noticia a la que se exponen los sujetos. 
+En principio calculamos esto ignorando los efectos especificos de grupo (los efectos random).
+
+```{r}
+avg_predictions(
+  update_model,
+  newdata = datagrid(news = c('good', 'bad')),
+  by = 'news',
+  re_formula = NA
+)
+avg_comparisons(
+  update_model,
+  newdata = datagrid(news = c('good', 'bad')),
+  variables = 'news',
+  re_formula = NA
+)
+avg_predictions(
+  update_model,
+  newdata = datagrid(news = c('good', 'bad')),
+  by = 'news',
+  re_formula = NA) |> posterior_draws() |>
+  pivot_wider(id_cols = drawid, names_from = news, values_from = draw) |> 
+  mutate(diferencia = good - bad) |>
+  pull(diferencia) |> ggdist::median_hdi()
+```
+
+Ahora incorporamos los efectos especificos de grupo (random). Para esto fijamos el error de prediccion y el true value en la media pero usamos para cada sujeto su puntaje de ansiedad y optimismo en lugar de asignarles a todos el mismo puntaje.
+
+```{r}
+fixed_values_df <- data.frame(
+  ep = mean(dexp1$ep),
+  pT = mean(dexp1$pT),
+  scoreAnsiedad = dexp1 %>% group_by(subj) %>% summarise(scoreAnsiedad = mean(scoreAnsiedad)) %>% pull(scoreAnsiedad),
+  scoreOptimismo = dexp1 %>% group_by(subj) %>% summarise(scoreOptimismo = mean(scoreOptimismo)) %>% pull(scoreOptimismo),
+  subj = dexp1$subj |> unique()
+)
+```
+
+Tenemos ahora entonces en un dataframe los puntajes de ansiedad y optimismo para cada sujeto y un valor promedio de error de prediccion que es el mismo para todos los sujetos. Ahora con esto duplicamos el dataframe para agregar una columna con el tipo de noticias, variando la valencia.
+
+```{r}
+tipical_pred_df <- rbind(
+  cbind(fixed_values_df, news = 'bad'),
+  cbind(fixed_values_df, news = 'good')
+)
+```
+
+Con esto ya podemos generar las predicciones.
+
+```{r}
+avg_predictions(
+  update_model,
+  newdata = tipical_pred_df,
+  by = 'news'
+)
+avg_comparisons(
+  update_model,
+  newdata = tipical_pred_df,
+  variables = 'news'
+)
+avg_predictions(
+  update_model,
+  newdata = tipical_pred_df,
+  by = 'news') |> posterior_draws() |>
+  pivot_wider(id_cols = drawid, names_from = news, values_from = draw) |> 
+  mutate(diferencia = good - bad) |>
+  pull(diferencia) |> ggdist::median_hdi()
+```
+
+Como segundo abordaje calculamos el efecto marginal usando los mismos datos es decir generando las predicciones para cada fila y luego promediando los resultados de las predicciones para cada tipo de noticia.
+
+```{r}
+avg_predictions(update_model, by = 'news')
+avg_predictions(update_model, by = 'news') |> posterior_draws() |>
+  pivot_wider(id_cols = drawid, names_from = news, values_from = draw) |> 
+  mutate(diferencia = good - bad) |>
+  pull(diferencia) |> ggdist::median_hdi()
+```
+
+Posteriormente nos preguntamos que pasa si cada trial fuera una noticia positiva o negativa. Este abordaje es muy similar al anterior donde fijamos los valores de error de prediccion, ansiedad, optimismo y true value. 
+
+```{r}
+avg_predictions(update_model, variables = 'news')
+avg_predictions(update_model, variables = 'news') |> posterior_draws() |>
+  pivot_wider(id_cols = drawid, names_from = news, values_from = draw) |> 
+  mutate(diferencia = good - bad) |>
+  pull(diferencia) |> ggdist::median_hdi()
+```
+
+Por ultimo calculamos el efecto de las noticias integrando los efectos random que no es lo mismo que usar unicamente los efectos fijos y omitir este componente. Para hacer esto hay dos maneras de calcularlo. Una es utilizando el paquete `brmsmargins`.
+
+```{r}
+library(brmsmargins)
+```
+
+Usamos la funcion `brmsmargins` y aclaramos que queremos el efecto marginal del tipo de noticias con el argumento `at` y ajustando el contraste para hacer la comparacion. A su vez obtenemos el highest density interval del 95% de la posterior para cada estimacion de efecto.
+
+```{r}
+news_effect <- brmsmargins(
+  update_model,
+  at = data.frame(news = c('good', 'bad')),
+  contrasts = cbind('AME news' = c(-1,1)),
+  effects = "integrateoutRE", k = 100L, seed = 1234,
+  CI = 0.95, CIType = "HDI"
+)
+
+news_effect$Summary
+```
+
+Entonces frente a buenas noticias el update (posterior a la marginalizacion) es de 0.15 mientras que frente a malas noticias es de 0.09 que es poco mas de la mitad. Viendo los intervalos el intervalo inferior de las buenas noticias (0.13) esta por encima del intervalo superior de las malas noticias (0.12) por mas de 0.1 con lo cual concluimos que el update es mayor para buenas que para malas noticias.
+
+Otra manera de calcular lo mismo es utilizando el paquete `marginaleffects`.
+
+```{r}
+library(marginaleffects)
+options("marginaleffects_posterior_interval" = "hdi")
+```
+
+En este caso generamos predicciones con la funcion `predictions`. Las predicciones las hacemos sobre nuevos valores de random effects es decir con sujetos/datos que el modelo nunca vio. De esta manera se samplean de la distribucion poblacional de efectos random. Los sampleos se hacen sobre la distribucion posterior de la esperanza condicional usando la funcion `posterior_epred`. Esto implica que hay un nivel menos de incertidumbre que si samplearamos hasta el nivel de la variable de respuesta. [Los detalles de esta diferencia en el nivel de incerteza estan explicitados en el blog de Andrew Heiss](https://www.andrewheiss.com/blog/2022/09/26/guide-visualizing-types-posteriors/) pero basicamente se ignora la varianza de la distribucion normal que subyace a un modelo de regresion lineal normal. Un mismo valor de predictor puede dar muchas predicciones individuales distintas por la varianza de las predicciones pero da un solo valor de esperanza de la prediccion. 
+
+```{r}
+predictions(
+    update_model,
+    newdata = datagrid(news = c('good','bad'), subj = -1:-100),
+    allow_new_levels = TRUE,
+    sample_new_levels = "gaussian")
+```
+
+Para imitar el resultado obtenido con el paquete `brmsmargins` tenemos que promediar las estimaciones para cada tipo de noticia. Podemos hacerlo usando el argumento `by` dentro de la misma funcion.
+
+```{r}
+predictions(
+    update_model,
+    newdata = datagrid(news = c('good','bad'), subj = -1:-100),
+    allow_new_levels = TRUE,
+    sample_new_levels = "gaussian",
+    by = 'news')
+```
+
+Comparando los resultados del paquete `brmsmargins` con los del paquete `marginaleffects` los resultados son muy similares.
+
+Podemos proceder a comparar directamente el contraste obtenido con `brmsmargins` y el obtenido usando la funcion `avg_predictions` de `marginaleffects`.
+
+```{r}
+news_effect$ContrastSummary
+
+avg_comparisons(
+    update_model,
+    newdata = datagrid(firm = -1:-100),
+    allow_new_levels = TRUE,
+    sample_new_levels = "gaussian", variables = 'news')
+```
+
+El mismo resultado podemos obtenerlo con la funcion `avg_slopes`.
+
+```{r}
+avg_slopes(update_model, newdata = datagrid(firm = -1:-100),
+    allow_new_levels = TRUE,
+    sample_new_levels = "gaussian", variables = c('news'))
+```
+
+Los valores son muy similares lo cual indica buena convergencia de los distintos metodos.
+
+No obstante, es posible calcular los efectos marginales sin integrar los efectos random del modelo. Para hacer esto el proceso es muy similar solo que obviamos la mencion a los nuevos sujetos, cada uno con efectos random sampleados a partir de la distribucion general de efectos random (asumida como gaussiana).
+
+Entonces por ejemplo para calcular el efecto marginal promedio de las noticias usamos de nuevo la funcion `predictions` pero excluimos el argumento `newdata` para agregar nuevos datos y los otros argumentos adicionales que controlan los efectos random.
+
+```{r}
+predictions(
+    update_model,
+    by = 'news', 
+    re_formula = NA)
+```
+
+En lineas generales los resultados se mantienen pero la diferencia es mucho mayor. 
+
+Para calcular directamente la diferencia (y los intervalos) usamos de nuevo la funcion `avg_slopes` y de nuevo excluimos todos los argumentos relativos a los nuevos datos.
+
+```{r}
+avg_slopes(update_model, variables = 'news')
+news_effect$ContrastSummary
+```
+
+Podemos comparar graficamente ambos metodos.
+
+```{r}
+news_effect_plotdata <- rbind(
+  predictions(update_model, by = 'news') |> tidy(),
+  predictions(
+    update_model,
+    newdata = datagrid(news = c('good','bad'), subj = -1:-100),
+    allow_new_levels = TRUE,
+    sample_new_levels = "gaussian",
+    by = 'news') |> tidy()
+) %>% mutate(integrateRE = rep(c(F,T), each = 2))
+
+news_effect_plotdata %>% 
+  ggplot(
+    aes(y = estimate, ymin = conf.low, ymax = conf.high, x = news, color = integrateRE)
+    ) +
+  geom_pointrange(position = position_dodge(.8))
+```
+
+En principio no hay grandes diferencias para las buenas noticias aunque la estimacion para las malas noticias muestra considerables diferencias con ambos metodos. Ahora podemos comparar los resultados de ambos metodos para el calculo de la diferencia (de manera directa).
+
+```{r}
+news_effect_difference_plotdata <- rbind(
+  avg_slopes(update_model, variables = 'news') |> broom.mixed::tidy(),
+  avg_slopes(update_model, newdata = datagrid(firm = -1:-100),
+    allow_new_levels = TRUE,
+    sample_new_levels = "gaussian", variables = c('news')) |> broom.mixed::tidy()
+) %>% mutate(integrateRE = c(F,T))
+
+news_effect_difference_plotdata %>%
+  ggplot(
+    aes(x = integrateRE, y = estimate, ymin = conf.low, ymax = conf.high)
+  ) +
+  geom_pointrange()
+```
+
+Cuando calculamos la diferencia no vemos que haya una diferencia marcada, valga la redundancia, entre ambos metodos. Considerando esto de ahora en mas no vamos a integrar los efectos aleatorios del modelo.
+
+Finalmente nos quedamos con el average marginal effect y graficamos aca el efecto directamente con la posterior.
+
+```{r}
+avg_predictions(update_model, by = 'news') |> posterior_draws() |>
+  ggplot(
+    aes(x = draw, fill = news)
+  ) +
+  stat_halfeye(alpha = 0.75) +
+  scale_y_continuous('Posterior Density', breaks = NULL) +
+  scale_fill_discrete('News Valence', labels = c('Bad News','Good News')) +
+  theme_tidybayes() + xlab("Update Response")
+```
+
+```{r}
+avg_predictions(update_model, by = 'news') |>
+  ggplot(
+    aes(x = news, y = estimate, ymin = conf.low, ymax = conf.high)
+  ) +
+  geom_pointrange() +
+  ylab("Update response") + xlab("News Valence") +
+  scale_x_discrete(labels = c("Bad News", "Good News")) +
+  theme_tidybayes()
+```
+
+
+## Prediction Error
+
+En este caso no tenemos un predictor categorico sino continuo. Lo que nos interesa entonces es entender el efecto del incremento del error de prediccion independientemente de la no-linealidad del modelo (las interacciones).
+
+Primero calculamos el efecto general del prediction error que siguiendo la definicion del paquete `marginaleffects` equivale a la derivada parcial de la regresion con respecto al regresor de interes. 
+
+```{r}
+avg_slopes(update_model, variables = 'ep')
+```
+
+Ahora procedemos a calcular de nuevo el efecto del error de prediccion y por efecto nos referimos a la derivada parcial de la pendiente pero esta vez diferenciando para los dos tipos de noticias ya que dado la interaccion pensamos que los distintos tipos de noticias nos marcan distintos efectos sobre el error de prediccion.
+
+```{r}
+avg_slopes(update_model, variables = c("ep"), by = c('news'))
+```
+
+Para computar la diferencia especifica usamos la distribucion posterior que nos arrojo estas dos pendientes y hacemos la diferencia. 
+
+```{r}
+avg_slopes(update_model, variables = c("ep"), by = c('news')) |>
+  posterior_draws() |>
+  pivot_wider(id_cols = drawid, names_from = news, values_from = draw) |> 
+  transmute(
+    diferencia = good - bad
+  ) |>
+  pull(diferencia) |>
+  ggdist::mean_hdi()
+```
+
+Graficamos la diferencia en las pendientes. 
+
+```{r}
+plot_predictions(update_model, condition = c("ep", "news"))
+```
+
+## Optimismo
+
+Este caso es similar al del error de prediccion. Primero calculamos el efecto marginal general del optimismo. 
+
+```{r}
+avg_slopes(update_model, variables = 'scoreOptimismo', re_formula = NULL)
+avg_slopes(update_model, variables = 'scoreOptimismo', re_formula = NA)
+```
+
+Despues calculamos el efecto marginal (la derivada parcial de la pendiente) sobre el optimismo para los dos tipos de noticias.
+
+```{r}
+avg_slopes(update_model, variables = c("scoreOptimismo"), by = c('news'))
+
+avg_slopes(update_model, variables = c("scoreOptimismo"), by = c('news')) |>
+   posterior_draws() |>
+  pivot_wider(id_cols = drawid, names_from = news, values_from = draw) |> 
+  transmute(
+    diferencia = good - bad
+  ) |>
+  pull(diferencia) |>
+  ggdist::mean_hdi()
+```
+
+```{r}
+avg_slopes(update_model, variables = c("scoreOptimismo"), by = c('news')) |>
+  posterior_draws() |>
+  ggplot(
+    aes(x = draw, fill = news)
+  ) +
+  stat_halfeye(alpha = 0.75) + 
+  scale_y_continuous('Posterior Density', breaks = NULL) +
+  scale_fill_discrete('News Valence', labels = c('Bad News','Good News')) +
+  theme_tidybayes() + xlab("Update Response")
+  
+avg_slopes(update_model, variables = c("scoreOptimismo"), by = c('news')) |>
+  ggplot(
+    aes(x = news, y = estimate, ymin = conf.low, ymax = conf.high)
+  ) +
+  geom_pointrange() +
+  scale_y_continuous('Average Marginal Effect (Slope)') +
+  scale_x_discrete('News Valence', labels = c('Bad News','Good News')) +
+  theme_tidybayes()
+```
+
+
+El efecto no cambia cuando integramos los efectos random.
+
+```{r}
+avg_slopes(update_model, newdata = datagrid(news = c('good','bad'), subj = -1:-100),
+    allow_new_levels = TRUE,
+    sample_new_levels = "gaussian",
+    variables = c("scoreOptimismo"), by = c('news'))
+```
+
+Graficamos
+
+```{r}
+plot_predictions(update_model, condition = c("scoreOptimismo", "news")) +
+  scale_y_continuous('Update Response') + xlab("Optimism") +
+  scale_color_discrete('News Valence', labels = c('Bad News','Good News')) +
+  scale_fill_discrete('News Valence', labels = c('Bad News','Good News')) +
+  theme_tidybayes()
+```
+
+Diferencia en la pendiente segun valor de prediction error por tipo de noticia
+
+```{r}
+plot_slopes(update_model, variables = 'scoreOptimismo', condition = c('ep','news'))
+```
+
+## Ansiedad
+
+Primero calculamos el efecto (la derivada parcial de la pendiente) sobre la ansiedad de manera general.
+
+```{r}
+avg_slopes(update_model, variables = 'scoreAnsiedad')
+```
+
+
+Ahora calculamos el efecto marginal (la derivada parcial de la pendiente) de la ansiedad para los dos tipos de noticias.
+
+```{r}
+avg_slopes(update_model, variables = c("scoreAnsiedad"), by = c('news'))
+avg_slopes(update_model, variables = c("scoreAnsiedad"), by = c('news')) |>
+   posterior_draws() |>
+  pivot_wider(id_cols = drawid, names_from = news, values_from = draw) |> 
+  transmute(
+    diferencia = good - bad
+  ) |>
+  pull(diferencia) |>
+  ggdist::mean_hdi()
+```
+
+El efecto no cambia cuando integramos los efectos random.
+
+```{r}
+avg_slopes(
+  update_model,
+  newdata = datagrid(news = c('good','bad'), subj = -1:-100),
+  allow_new_levels = TRUE,
+  sample_new_levels = "gaussian",
+  variables = 'scoreAnsiedad', by = 'news'
+)
+```
+
+
+Graficamos
+
+```{r}
+avg_slopes(update_model, variables = c("scoreAnsiedad"), by = c('news')) |>
+  posterior_draws() |>
+  ggplot(
+    aes(x = draw, fill = news)
+  ) +
+  stat_halfeye(alpha = 0.75) + 
+  scale_y_continuous('Posterior Density', breaks = NULL) +
+  scale_fill_discrete('News Valence', labels = c('Bad News','Good News')) +
+  theme_tidybayes() + xlab("Update Response")
+  
+avg_slopes(update_model, variables = c("scoreAnsiedad"), by = c('news')) |>
+  ggplot(
+    aes(x = news, y = estimate, ymin = conf.low, ymax = conf.high)
+  ) +
+  geom_pointrange() +
+  scale_y_continuous('Average Marginal Effect (Slope)') +
+  scale_x_discrete('News Valence', labels = c('Bad News','Good News')) +
+  theme_tidybayes()
+```
+
+
+Diferencia en la pendiente segun valor de prediction error por tipo de noticia
+
+```{r}
+plot_predictions(update_model, variables = 'scoreAnsiedad') +
+  scale_y_continuous('Update Response') + xlab("Optimism") +
+  scale_color_discrete('News Valence', labels = c('Bad News','Good News')) +
+  scale_fill_discrete('News Valence', labels = c('Bad News','Good News')) +
+  theme_tidybayes()
+```
+
+## Sensitivity Analysis
+
+```{r}
+small_priors <- c(
+  set_prior('normal(0,1)', class = 'b')
+)
+
+update_sensitivity_model <- brm(update ~ 
+                news * scoreOptimismo * ep +
+                news * scoreAnsiedad * ep +
+                news * pT +
+                (1 | subj),
+              data = dexp1,
+              seed = 1234, # for reproducibility
+              cores = 4, chains = 4,
+              prior = small_priors,
+              iter = 10000, 
+              file = "model_fits/FitExp1_sensitivity"
+)
+
+
+(
+  tidybayes::tidy_draws(update_model) |> select(matches('b_')) - tidybayes::tidy_draws(update_sensitivity_model) |> select(matches('b_')) ) |> 
+  pivot_longer(cols = everything(), names_to = 'coeficients', values_to = 'difference') |>
+  ggplot(
+  aes(y = coeficients, x = difference)
+) + stat_pointinterval()
+```
+
+
+```{r}
+data.frame(
+  draws = c(
+    tidybayes::tidy_draws(update_model) |> pull(`b_ep`),
+    tidybayes::tidy_draws(update_sensitivity_model) |> pull(`b_ep`)
+    ),
+  prior = rep(c('default','normal'), each = 20000)
+) |> 
+  ggplot(
+    aes(x = draws, color = prior)
+  ) +
+  geom_density()
+```
+
+
+```{r}
+epred_draws(
+  update_model,
+  newdata = data.frame(
+    scoreOptimismo = 18.62787,
+    scoreAnsiedad = 26.65902,
+    ep = 0.2325369,	
+    pT = 0.3034508,
+    subj = 13,
+    news = 'good'
+  )
+) %>% pull(`.epred`) %>% 
+  median_hdi()
+
+marginaleffects::avg_predictions(update_model, variables = 'news')
+```
+
+
+

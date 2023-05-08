@@ -1,0 +1,151 @@
+---
+title: "Modelo Optimismo"
+author: "Alejandro Ramos Usaj"
+date: "2023-04-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(marginaleffects_posterior_interval = "hdi")
+options(marginaleffects_posterior_center = mean)
+```
+
+
+```{r}
+library(brms)
+library(tidybayes)
+library(tidyverse)
+library(bayesrules)
+library(bayesplot)
+library(marginaleffects)
+```
+
+
+
+```{r}
+#Load data
+load('../data/exp1_data.RData')
+
+#Compute influence score based on Zanete and factor column for good/bad news 
+dexp1 <- dexp1 %>%
+  mutate(
+    influencia = (p2-p1)/(pT-p1),
+    news = factor(ifelse(I==0, "bad", "good")),
+    subj = as.integer(subj)
+  )
+```
+
+
+
+```{r}
+ggplot(dexp1, aes(x = scoreOptimismo, y = p1)) + 
+  geom_jitter() +
+  geom_smooth()
+```
+
+
+```{r}
+ggplot(dexp1,
+       aes(x = scoreOptimismo, y = p1)) + 
+  geom_boxplot(aes(group = cut_width(scoreOptimismo, 1)))
+```
+
+
+
+```{r}
+ggplot(
+  dexp1,
+  aes(x = p1, group = subj, color = scoreOptimismo)
+) +
+  geom_density()
+```
+
+
+```{r}
+filtered_data <- dexp1 |> filter(p1 > 0 & p1 < 1)
+```
+
+
+
+```{r}
+beta_model <- brm(
+  bf(p1 ~ scoreOptimismo + (1|subj),
+     phi ~ (1|subj)),
+  data = filtered_data,
+  family = Beta(),
+  chains = 4, iter = 2000, warmup = 1000,
+  cores = 4, seed = 1234
+)
+```
+
+Mostramos un resumen de los coeficientes calculados con el modelo.
+
+```{r}
+broom.mixed::tidy(beta_model)
+```
+
+¿Cual es el efecto del optimismo sobre la prediccion?
+
+```{r}
+avg_slopes(beta_model)
+```
+
+A mayor optimismo, menor prediccion. 
+
+```{r}
+avg_comparisons(beta_model)
+```
+
+Entonces vemos lo mismo de nuevo, si el optimismo incrementa en un punto, el estimado baja 1% en promedio. Sin embargo entendemos que el efecto del optimismo no es constante al ser una funcion no lineal. 
+
+Para ver entonces el efecto del optimismo vamos a graficar las predicciones para distintos valores de la escala ignorando los efectos grupo.
+
+```{r}
+predictions(
+  beta_model,
+  newdata = data.frame(
+    scoreOptimismo = seq(0,32,1),
+    subj = -1
+  ),
+  re_formula = NA
+) |> posterior_draws() |>
+  ggplot(
+    aes(x = scoreOptimismo, y = draw)
+  ) +
+  stat_lineribbon(point_interval = 'mean_hdi') + scale_fill_brewer('Posterior credible interval') + 
+  xlab("Optimism") + ylab("Posterior Prediction") +
+  theme_tidybayes() + theme(legend.position = 'bottom')
+```
+
+La no linealidad del efecto es muy leve dentro del rango de valores que tiene la escala utilizada (que van de 0 a 32). Podemos ver esto de manera mas clara calculando la pendiente (primera derivada) para cada valor de la escala de optimismo para cada sujeto y superponerlo con la pendiente calculada para cada valor de la escala ignorando los efectos grupo. 
+
+```{r}
+slopes(
+  beta_model,
+  newdata = datagrid(scoreOptimismo = seq(0,32,1), subj = 1:33)
+) |>
+  ggplot(
+    aes(x = scoreOptimismo, y = estimate, ymin = conf.low, ymax = conf.high)
+  ) +
+  geom_line(aes(group = subj), color = 'grey') +
+  geom_line(
+    data = slopes(beta_model, newdata = data.frame(scoreOptimismo = seq(0,32,1), subj = -1), re_formula = NA),
+    linetype = 'dashed', size = 1
+  ) +
+  theme_tidybayes() + xlab("Optimism") + ylab("Slope")
+```
+
+Ahora intentamos volver a graficar el efecto marginal del optimismo pero incorporando los efectos aleatorios. 
+
+```{r}
+avg_predictions(beta_model, variables = 'scoreOptimismo') |> posterior_draws() |>
+  ggplot(
+    aes(x = scoreOptimismo, y = draw)
+  ) +
+  stat_lineribbon(point_interval = 'mean_hdi') + scale_fill_brewer('Posterior credible interval') + 
+  xlab("Optimism") + ylab("Posterior Prediction") +
+  theme_tidybayes() + theme(legend.position = 'bottom')
+```
+
+
